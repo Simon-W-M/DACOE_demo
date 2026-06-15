@@ -1,0 +1,511 @@
+---
+title: "Awesome R report into bed occupancy and los"
+date: "`r Sys.Date()`"
+author: S Wellesley-Miller
+date-format: "D MMMM YYYY"
+
+format:
+  html:
+    toc: true
+    toc_float: true
+    number-sections: false
+    title-block-banner: true
+    title-block-banner-color: <#005EB8>
+    self-contained: true 
+---
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(paste0("NHS_logo.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:5%; padding:10px;',
+               width = "300px",
+               heigth = "200px")
+```
+
+
+```{r}
+#| echo: false
+#| warning: false
+
+library(ggpubr)
+library(tidyverse)
+library(NHSRplotthedots)
+library(gghighlight)
+library(geomtextpath)
+library(scales)
+
+options(warn = -1)
+
+# generate random data
+
+# ward names
+wards <- c("bulbasaur", "squirtle", "charmander", "pikachu")
+# number of beds in each ward
+no_beds <- c(67, 16, 38, 40)
+
+# number of beds dataframe
+beds_data <- data.frame(
+  ward = wards,
+  no_beds
+)
+
+# create a pretty list of names
+format_list <- function(x) {
+  if (length(x) == 1) {
+    return(x)
+  }
+  paste(paste(x[-length(x)], collapse = ", "), "and", x[length(x)])
+}
+
+# create random patient data
+ward <- sample(c("bulbasaur", "bulbasaur", "squirtle", 
+                 "squirtle", "charmander", "pikachu", "pikachu"), 
+               3000, replace = TRUE)
+
+# create patiend id number
+patient <- seq(1, 3000)
+
+start_date <- as.Date("2025-01-01")
+end_date <- as.Date("2025-12-31")
+
+# Generate a sequence of all daily dates in that 12-month window
+all_dates <- seq(from = start_date, to = end_date, by = "day")
+
+# Create a data frame, group by month, and sample 35 dates per group
+# to ensure there are some each month
+random_dates_df <- data.frame(admission_date = all_dates) |>
+  mutate(
+    Year = year(admission_date),
+    Month = month(admission_date, label = TRUE, abbr = FALSE) # Returns full month name
+  ) |>
+  group_by(Year, Month) |>
+  slice_sample(n = 35, replace = TRUE) |>
+  arrange(Year, Month, admission_date) |> # Sort chronologically
+  ungroup() |>
+  slice_sample(n = 3000, replace = TRUE) |> # select 3000 again at random from the start dates
+  select(admission_date)
+
+# join all into a single dataframe
+ward_data <- bind_cols(
+  ward = ward,
+  patient = patient,
+  random_dates_df
+)
+
+# now calulate random end dates
+ward_data <- ward_data |>
+  rowwise() |>
+  mutate(discharge_date = case_when(ward == "bulbasaur" ~ admission_date + days(as.integer(abs(rnorm(1, 20, 4)))),
+    ward == "squirtle" ~ admission_date + days(as.integer(abs(rexp(1, 1 / 3)))),
+    ward == "charmander" ~ admission_date + days(as.integer(rexp(1, 1 / 5))),
+    ward == "pikachu" ~ admission_date + days(as.integer(rexp(1, 1 / 10))),
+    .default = admission_date
+  )) |>    # charmander ward has some extra stuff happening to it after June
+  mutate(discharge_date = if_else(ward == "charmander" & admission_date > as.Date("2025/06/01"),
+    discharge_date + as.integer(abs(rnorm(1, 20, 4))),
+    discharge_date
+  )) |>
+  ungroup()
+
+```
+
+```{r} 
+#| echo: false
+#| warning: false
+
+# start of analysis
+ward_data <- ward_data |>
+  mutate(los = as.numeric(discharge_date - admission_date))
+
+density_plot <- ward_data |> 
+  ggdensity(
+  x = "los",
+  add = "mean", 
+  facet.by = "ward",
+  rug = TRUE,
+  color = "ward", 
+  fill = "ward"
+) +
+  facet_wrap(~ward,
+             scales = 'free_y') +
+  theme(legend.position = "none") 
+
+# create spc
+ward_data_average <- ward_data |>
+  mutate(discharge_month = as.Date(format(discharge_date, "%Y-%m-01")) + 
+           months(1) - 1) |>
+  summarise(mean_av = mean(los),
+            median_av = median(los),
+            .by = c(ward,
+                    discharge_month)) |>
+  arrange(ward,
+          discharge_month)
+
+spc_los <- ward_data_average |>
+  filter(discharge_month < as.Date('2025/12/31')) |>
+  ptd_spc(date_field = discharge_month,
+          value_field = median_av,
+          facet_field = ward,
+          improvement_direction = "decrease",
+          target = ptd_target('bulbasaur' = 23,
+                    'charmander' = 21,
+                    'pikachu' = 15,
+                    'squirtle' = 5))
+
+increase <- spc_los |>
+  filter(x == max(x),
+         point_type == 'special_cause_concern') |>
+  pull(f)
+
+spc_los_plot <- spc_los |>
+  ptd_create_ggplot(fixed_y_axis_multiple = FALSE,
+                    icons_position = "top left",
+                    point_size = 2,
+                    x_axis_date_format = "%b %y",
+                    x_axis_label = 'Discharge month',
+                    y_axis_label = 'Median in Days') +
+  labs (title = paste0(str_to_title(increase), ' is showing a special cause increase in length of stay'),
+        subtitle = paste0('SPC chart of lengths of lengths of stay: ', 
+                          format(min(spc_los$x), '%b %y'), 
+                          ' - ',
+                          format(max(spc_los$x), '%b %y')),
+        caption = paste0('Data made up on ',format(Sys.Date(), '%y-%m-%d')))
+
+# calculate occupancy
+month_ends <- tibble(month_end = seq(from = start_date, 
+                                     to = end_date, 
+                                     by = "1 month") |>
+                          ceiling_date("month") - days(1))
+
+# join and count patients present at each month-end
+monthly_ward_counts <- month_ends |>
+  inner_join(ward_data, 
+             join_by(between(month_end, 
+                             admission_date, 
+                             discharge_date))) |> 
+  summarise(patient_count = n(), 
+            .by = c(ward, 
+                    month_end))
+
+# now add on the number of beds and calculate % occupancy
+
+monthly_ward_counts <- monthly_ward_counts |>
+  left_join(beds_data) |>
+  mutate(perc_occ = patient_count / no_beds)
+
+monthly_ward_counts_plot <- monthly_ward_counts |>
+  ggplot() +
+  aes(x = month_end,
+      y = perc_occ,
+      colour = ward) +
+  geom_line(size = 1) +
+  facet_wrap(~ward) +
+  theme_minimal() +
+  theme(legend.position = 'none') +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = 'Position at month end',
+       y = '%Occupancy',
+    title = 'Charmander ward is showing an marked increase in occupancy',
+            subtitle = paste0('Line chart of percentage occupancy: ', 
+                          format(min(spc_los$x), '%b %y'), 
+                          ' - ',
+                          format(max(spc_los$x), '%b %y')),
+        caption = paste0('Data made up on ',format(Sys.Date(), '%y-%m-%d')))
+
+## charmader focus
+latest_full_mth <- max(monthly_ward_counts$month_end)
+start <- min(monthly_ward_counts$month_end)
+intervention_date <- as.Date("2025-06-30")
+
+y_min <- min(monthly_ward_counts$perc_occ[monthly_ward_counts$ward == "charmander" & monthly_ward_counts$month_end >= intervention_date])
+
+y_max <- max(monthly_ward_counts$perc_occ[monthly_ward_counts$ward == "charmander" & monthly_ward_counts$month_end >= intervention_date])
+
+start <- min(monthly_ward_counts$month_end)
+
+int_dat_less_one <- as.Date("2025-05-30")
+
+y_min_pre <- min(monthly_ward_counts$perc_occ[monthly_ward_counts$ward == "charmander" & monthly_ward_counts$month_end <= int_dat_less_one])
+y_max_pre <- max(monthly_ward_counts$perc_occ[monthly_ward_counts$ward == "charmander" & monthly_ward_counts$month_end <= int_dat_less_one])
+
+charmander_focus <- monthly_ward_counts |> 
+  ggplot() +
+  aes(
+  x = month_end,
+  y = perc_occ,
+  colour = ward
+) +
+  geom_line(size = 2) +
+  scale_x_date(
+    date_labels = "%b %y",
+    date_breaks = "2 month"
+  ) +
+  gghighlight(ward == "charmander",
+    line_label_type = "sec_axis",
+    label_params = list(size = 4)
+  ) +
+  theme_minimal() +
+  annotate("rect",
+    xmin = intervention_date, xmax = latest_full_mth,
+    ymin = y_min, ymax = y_max,
+    fill = "lightblue", alpha = 0.5
+  ) +
+  annotate("rect",
+    xmin = start, xmax = int_dat_less_one,
+    ymin = y_min_pre, ymax = y_max_pre,
+    fill = "lightgrey", alpha = 0.5
+  ) +
+  geom_vline(
+    xintercept = intervention_date,
+    color = "#009639", linetype = "dashed", size = 1
+  ) +
+  geom_text(
+    aes(
+      x = intervention_date - months(1),
+      y = 0.5, label = "Start of intervention"
+    ),
+    colour = "#009639", size = 3.5
+  ) +
+  geom_text(
+    aes(
+      x = intervention_date + months(3) ,
+      y = 0.9, label = "Marked improvement in bed utilisiation"
+    ),
+    colour = "#005EB8", size = 4, alpha = 0.9
+  ) +
+  geom_text(
+    aes(
+      x = intervention_date - months(3),
+      y = 0.2, label = "Pre intervention"
+    ),
+    colour = "#425563", size = 3.5, alpha = 0.7
+  ) +
+  labs(
+    title = "Charmander Ward has improvement in bed utilisation since intervention",
+    subtitle = "Chart showing % occupancy Jan 25 - Dec 25 by ward - Charmander Highlighted",
+    caption = paste0('Data made up on ',format(Sys.Date(), '%y-%m-%d'))
+  ) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+ward_data_joined <- ward_data_average |>
+  left_join(monthly_ward_counts,
+            by = c('ward' = 'ward', 'discharge_month' = 'month_end'))
+
+ward_data_char <- ward_data_joined |>
+  filter(ward == 'charmander',
+         !is.na(no_beds)) |>
+  mutate(after_intervention = if_else(discharge_month < as.Date('2025-06-01'),
+                                      '0',
+                                      '1'))
+
+all_wards_corrleation <- ward_data_joined |>
+  filter(median_av < 500) |>
+  ggplot() +
+  aes(x= median_av,
+      y= perc_occ) +
+  geom_point() + 
+  geom_smooth(method = 'lm', se = F) +
+  stat_cor(method = 'pearson',
+           p.accuracy = 0.001,
+           r.accuracy = 0.01) +
+  facet_wrap(~ward,
+             scales = 'free_x') +
+      scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal()+ 
+  labs(
+    title = "Charmander Ward is showing higher lengths of stay along side higher occupancy since intervention",
+    subtitle = "Chart showing mediand LOS and % Occupancy  Jan 25 - Dec 25 by ward",
+    caption = paste0("Data made up on ", format(Sys.Date(), "%y-%m-%d")),
+    x = "Median length of stay",
+    y = "Percent occupancy"
+  ) +
+  theme(
+    legend.position = "none"
+  ) 
+
+
+charmander_corr <- ggplot() +
+  geom_point(
+    data = ward_data_char,
+    aes(
+      x = median_av,
+      y = perc_occ,
+      colour = after_intervention
+    )
+  ) +
+  geom_smooth(
+    data = ward_data_char,
+    aes(
+      x = median_av,
+      y = perc_occ
+    ),
+    method = "lm", se = F
+  ) +
+  stat_cor(
+    method = "pearson",
+    p.accuracy = 0.001,
+    r.accuracy = 0.01
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Charmander Ward is showing higher lengths of stay along side higher occupancy since intervention",
+    subtitle = "Chart showing mediand LOS and % Occupancy  Jan 25 - Dec 25 by ward",
+    caption = paste0("Data made up on ", format(Sys.Date(), "%y-%m-%d")),
+    x = "Median length of stay",
+    y = "Percent occupancy"
+  ) +
+  theme(
+    legend.position = "none"
+  ) +
+  geom_text(
+    aes(
+      x = 12,
+      y = 0.9, label = "Higher utilisation and LOS"
+    ),
+    colour = "#005EB8", size = 4, alpha = 0.9
+  ) 
+
+
+
+
+```
+
+
+
+# Introduction
+
+This is a report that explores the distribution of patients lengths of stay and ward occupancy 
+across **`r format_list(str_to_title( wards))`** wards.
+
+It contains a bunch of dummy data that is created in the report and specifically Charmander ward has a changed distribution of lengths of stay that occurs in June 2025.
+
+Using the same functions as before and with a few additional elements to the graphs we can combine these elements into an interactive 'Quarto' report.
+
+::: {.callout-note collapse="false" appearance="default" icon="true"}
+## Information 
+
+The output of this report is a stand alone HTML file that can be emailed, saved to sharepoint and used like any other file, it can also be opened an utilised on any device such as a pc, tablet or mobile phone.  
+:::
+
+
+# Length of stay
+
+These graphs show distrubtions of LOS over time and the change of median LOS at month end.
+
+::: {.panel-tabset .nav-pills}
+
+### Relative distributions of length of stay by ward
+
+
+```{r}
+#| echo: false
+#| warning: false
+
+density_plot
+
+```
+
+This chart allows us to see the expected distribution of length of stay across each ward.  For a ward that does a specific procedure we would perhaps expect to see a bell curve 'normal distribution'.  For a ward that potentially has shorter stays before moving patients on such as an ICU, we may expect to see more of an exponential distribution.  
+
+### SPC of length of stay time series
+
+```{r}
+#| echo: false
+#| warning: false
+
+spc_los_plot
+
+```
+
+Due to the LOS, not being a normal distribution, median lengths of stay are plotted.
+
+:::
+
+# Occupancy
+
+::: {.panel-tabset .nav-pills}
+
+### Occupancy across all wards
+
+```{r}
+#| echo: false
+#| warning: false
+
+monthly_ward_counts_plot
+
+```
+
+Exploring all wards we can see that they are mostly in the same range, except for Charmander Ward.  We know that Charmander Ward has had a change in practice as of June 2025 and the focus chart shows more detail on this.  
+
+### Focus on Charmander Ward
+
+```{r}
+#| echo: false
+#| warning: false
+
+charmander_focus
+
+```
+
+Since the intervention we can clearly see that Charmander Ward has had an increase in occupancy. 
+
+:::
+
+# Correlation of occupancy and lengths of stay
+
+::: {.panel-tabset .nav-pills}
+
+### All wards
+
+```{r}
+#| echo: false
+#| warning: false
+
+all_wards_corrleation
+
+```
+
+Looking across all wards, only in Charmander ward is there a significant correlation between occupancy and LOS.  
+
+### Focus on Charmander Ward
+
+```{r}
+#| echo: false
+#| warning: false
+charmander_corr
+
+options(warn = 0)
+
+```
+
+We can see that the intervention has resulted in higher occupancy and in addition to a significant increase in length of stay.  
+
+:::
+
+::: {.callout-warning collapse="false" appearance="default" icon="true"}
+## Conclusion
+
+This analysis shows that the intervention in Charmander Ward has had an impact on lengths of stay and bed occupancy. 
+:::
+
+# Confidentiality 
+
+All data used in this report is complete made up gibberish.  
+
+The code to produce this report is freely available under MIT licence at  
+
+[https://github.com/Simon-W-M/DACOE_demo](https://github.com/Simon-W-M/DACOE_demo)
+
+> Contact  
+> [**Simon Wellesley-Miller**](mailto:Simon.Wellesley-Miller@nhs.net)\
+> *Senior Analytical Manager*  
+>   
+> South West Insights and Intelligence
+> NHS England  
+> Version 1.0 - 15 June 2026
+
+
